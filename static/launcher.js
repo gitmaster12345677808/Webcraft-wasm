@@ -106,6 +106,14 @@ mtCanvas.tabIndex = "-1";
 mtCanvas.width = 1024;
 mtCanvas.height = 600;
 
+// Global flags used by UI/layout code to avoid focusing the canvas
+// while the mobile/native or the JS on-screen keyboard are active.
+// These are intentionally globals so top-level helpers such as
+// fixGeometry() can access them safely regardless of whether
+// createMobileControls() has run or not.
+var mobileKeyboardActive = false;
+var jsKeyboardActive = false;
+
 var consoleButton;
 var consoleOutput;
 var progressBar;
@@ -128,6 +136,9 @@ function activateBody() {
     const canvasContainer = document.getElementById('canvas_container');
     canvasContainer.appendChild(mtCanvas);
 
+    // Create an on-canvas mobile controls overlay for touch devices
+    createMobileControls(canvasContainer, mtCanvas);
+
     setupResizeHandlers();
 
     consoleButton = document.getElementById('console_button');
@@ -138,6 +149,1066 @@ function activateBody() {
     progressBar = document.getElementById('progressbar');
     progressBarDiv = document.getElementById('progressbar_div');
     updateProgressBar(0, 0);
+}
+
+// Mobile controls helper - overlays touch-friendly UI and maps touches to
+// keyboard/mouse events so the wasm game receives input on mobile.
+function createMobileControls(container, canvas) {
+    // Only enable overlay on touch devices / small screens
+    const isTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
+    // Detect iOS (includes iPadOS which can report Mac platform but still be touch-enabled)
+    // Use both UA and the MacIntel+touch heuristic which is common for iPadOS.
+    const isiOS = /iPad|iPhone|iPod/i.test(navigator.userAgent || '') || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+    if (!isTouch) return;
+
+    const overlay = document.createElement('div');
+    overlay.id = 'mobile_overlay';
+    overlay.style = `
+      position: absolute;
+      left: 0; top: 0; right: 0; bottom: 0;
+      pointer-events: none; /* allow underlying canvas when not interacting */
+      z-index: 9999;
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      padding: 12px;
+    `;
+
+    // left joystick
+    const leftPad = document.createElement('div');
+    leftPad.id = 'mobile_leftpad';
+    leftPad.style = `
+      pointer-events: auto;
+      width: 36vmin; height: 36vmin; max-width: 260px; max-height: 260px;
+      border-radius: 999px; background: rgba(0,0,0,0.18);
+      display:flex; align-items:center; justify-content:center; margin:8px;
+      touch-action: none; -webkit-user-select: none; user-select: none;
+    `;
+    // joystick thumb
+    const leftThumb = document.createElement('div');
+    leftThumb.style = `
+      width: 24%; height: 24%; background: rgba(255,255,255,0.18);
+      border-radius: 999px; transform: translate(0,0);
+    `;
+    leftPad.appendChild(leftThumb);
+
+    // right pad for look/aim
+    const rightPad = document.createElement('div');
+    rightPad.id = 'mobile_rightpad';
+    rightPad.style = `
+      pointer-events: auto;
+      width: 44vmin; height: 44vmin; max-width: 320px; max-height: 320px;
+      border-radius: 20px; background: rgba(0,0,0,0.04);
+      display:flex; align-items:center; justify-content:center; margin:8px;
+      touch-action: none; -webkit-user-select: none; user-select: none;
+    `;
+
+    // right pad helper text
+    const rightHint = document.createElement('div');
+    rightHint.style = `color: rgba(255,255,255,0.6); font-size: 12px; text-align:center;`;
+    rightHint.innerText = 'Drag to look — tap to interact';
+    rightPad.appendChild(rightHint);
+
+    // buttons cluster
+        const buttons = document.createElement('div');
+        buttons.style = `
+            pointer-events: auto; display:flex; flex-direction:row; gap:12px; align-items:center; margin:18px; justify-content:center;
+        `;
+    const btnStyle = `
+      pointer-events: auto; min-width: 58px; min-height: 58px; border-radius: 16px;
+      background: rgba(0,0,0,0.22); color: white; display:flex; align-items:center; justify-content:center;
+      box-shadow: 0 6px 18px rgba(0,0,0,0.4); font-weight:700; font-size:18px; touch-action: none;
+    `;
+
+    // Create two vertically stacked buttons: Jump (Space) and Use (right-click)
+    const btnJump = document.createElement('button'); btnJump.id = 'mc_jump'; btnJump.innerText = 'Jump'; btnJump.style = btnStyle;
+    const btnUse = document.createElement('button'); btnUse.id = 'mc_use'; btnUse.innerText = 'Use'; btnUse.style = btnStyle;
+
+    // Inventory button (E key)
+    const btnInv = document.createElement('button'); btnInv.id = 'mc_inv'; btnInv.innerText = 'Inv'; btnInv.title = 'Open Inventory (I)'; btnInv.style = btnStyle + ' font-size:14px; padding: 10px 14px;';
+
+    // Hotbar arrows - horizontal left/right buttons
+    const hbLeft = document.createElement('button'); hbLeft.id = 'mc_hbleft'; hbLeft.innerText = '◀'; hbLeft.title = 'Hotbar - previous'; hbLeft.style = btnStyle + ' width:48px; height:48px; font-size:20px;';
+    const hbRight = document.createElement('button'); hbRight.id = 'mc_hbright'; hbRight.innerText = '▶'; hbRight.title = 'Hotbar - next'; hbRight.style = btnStyle + ' width:48px; height:48px; font-size:20px;';
+
+    // place vertically (flex-direction: column already set on container)
+    // layout order: Jump | Use | Inv | ◀ ▶
+    buttons.appendChild(btnJump);
+    buttons.appendChild(btnUse);
+    buttons.appendChild(btnInv);
+    buttons.appendChild(hbLeft);
+    buttons.appendChild(hbRight);
+
+    overlay.appendChild(leftPad);
+    overlay.appendChild(buttons);
+        overlay.appendChild(rightPad);
+
+        // Replace Invite/Join with Chat, Menu (pause) and a Keyboard button.
+        // Chat opens the in-game chat (T). Pause sends ESC to open the pause menu.
+        // Keyboard will focus a hidden input so mobile keyboards appear for typing.
+        const chatBtn = document.createElement('button');
+        chatBtn.id = 'mc_chat';
+        chatBtn.innerText = 'Chat';
+        chatBtn.title = 'Open chat (T)';
+        chatBtn.style = `
+            position: absolute; left: 50%; transform: translateX(-50%); top: 12px;
+            pointer-events: auto; padding: 8px 12px; border-radius: 12px; font-weight:700;
+            background: rgba(0,0,0,0.22); color: #fff; z-index: 10000; border: none;
+        `;
+        container.appendChild(chatBtn);
+
+        const menuBtn = document.createElement('button');
+        menuBtn.id = 'mc_menu';
+        menuBtn.innerText = 'Menu';
+        menuBtn.title = 'Pause / Menu (Esc)';
+        menuBtn.style = `
+            position: absolute; left: calc(50% + 92px); transform: translateX(-50%); top: 12px;
+            pointer-events: auto; padding: 8px 12px; border-radius: 12px; font-weight:700;
+            background: rgba(0,0,0,0.22); color: #fff; z-index: 10000; border: none;
+        `;
+        container.appendChild(menuBtn);
+
+        // Small keyboard button — focuses a hidden input to bring up the system keyboard
+        const keyboardBtn = document.createElement('button');
+        keyboardBtn.id = 'mc_keyboard';
+        keyboardBtn.innerText = '⌨';
+        keyboardBtn.title = 'Show keyboard';
+        keyboardBtn.style = `
+            position: absolute; left: calc(50% - 92px); transform: translateX(-50%); top: 12px;
+            pointer-events: auto; padding: 8px 10px; border-radius: 12px; font-weight:700; font-size:16px;
+            background: rgba(0,0,0,0.22); color: #fff; z-index: 10000; border: none;
+        `;
+        container.appendChild(keyboardBtn);
+
+        // Secondary button to open the JS on-screen keyboard (useful on
+        // mobile when you want the in-page keyboard instead of the OS one).
+        const jsShowBtn = document.createElement('button');
+        jsShowBtn.id = 'mc_js_show';
+        jsShowBtn.innerText = 'JS';
+        jsShowBtn.title = 'Show JS keyboard';
+        jsShowBtn.style = `
+            position: absolute; left: calc(50% - 128px); transform: translateX(-50%); top: 12px;
+            pointer-events: auto; padding: 8px 8px; border-radius: 12px; font-weight:700; font-size:14px;
+            background: rgba(0,0,0,0.22); color: #fff; z-index: 10000; border: none;
+        `;
+        container.appendChild(jsShowBtn);
+
+        // Hidden input used to receive typed characters on mobile — kept off-screen
+        const hiddenInput = document.createElement('input');
+        hiddenInput.id = 'mc_text_input';
+        hiddenInput.type = 'text';
+        hiddenInput.autocapitalize = 'none';
+        hiddenInput.autocomplete = 'off';
+        hiddenInput.autocorrect = 'off';
+        hiddenInput.spellcheck = false;
+        // Keep the hidden input on-screen (but visually invisible) so mobile
+        // browsers will show and keep the keyboard open when focused.
+        hiddenInput.style = 'position:absolute; right:12px; bottom:12px; width:1px; height:1px; opacity:0; z-index:11000;';
+        container.appendChild(hiddenInput);
+        // Track mobile keyboard state so we don't refocus the canvas while typing.
+        hiddenInput.addEventListener('focus', () => { mobileKeyboardActive = true; });
+        hiddenInput.addEventListener('blur', () => { mobileKeyboardActive = false; });
+
+        // Utility: synthesize a lowercase T key press (open chat)
+        function sendLowercaseT() {
+            try { if (!mobileKeyboardActive && !jsKeyboardActive) canvas.focus(); } catch (e) {}
+            const code = 'KeyT';
+            const keyChar = 't';
+            const keyDownCode = 84; // 'T'
+            const charCode = keyChar.charCodeAt(0);
+            try {
+                const ev = new KeyboardEvent('keydown', { code: code, key: keyChar, keyCode: keyDownCode, which: keyDownCode, bubbles: true, cancelable: true });
+                canvas.dispatchEvent(ev); document.dispatchEvent(ev); window.dispatchEvent(ev);
+            } catch (err) {}
+            try {
+                const kp = new KeyboardEvent('keypress', { key: keyChar, code: code, keyCode: charCode, which: charCode, charCode: charCode, bubbles: true, cancelable: true });
+                canvas.dispatchEvent(kp); document.dispatchEvent(kp); window.dispatchEvent(kp);
+            } catch (err) {}
+            setTimeout(() => {
+                try { const ev2 = new KeyboardEvent('keyup', { code: code, key: keyChar, keyCode: keyDownCode, which: keyDownCode, bubbles: true, cancelable: true }); canvas.dispatchEvent(ev2); document.dispatchEvent(ev2); window.dispatchEvent(ev2); } catch (err) {}
+            }, 60);
+        }
+
+        // Pause menu — send an Escape keypress to the engine
+        function sendEscapePress() {
+            try { if (!mobileKeyboardActive && !jsKeyboardActive) canvas.focus(); } catch (e) {}
+            try { sendKey('Escape', true); } catch (e) {}
+            setTimeout(() => { try { sendKey('Escape', false); } catch (e) {} }, 60);
+        }
+
+        // Wire up the buttons
+        chatBtn.addEventListener('click', (e) => { e.preventDefault(); sendLowercaseT(); showJSKeyboard(true); });
+        menuBtn.addEventListener('click', (e) => { e.preventDefault(); sendEscapePress(); });
+        // Focus input early on touchstart so virtual keyboards show reliably.
+        // Special handling for iOS: some WebKit configurations require a user gesture
+        // that actually focuses a visible/usable input and the engine's chat UI
+        // may need to be opened first. To reliably type in game chat on iOS,
+        // synthesize a single lowercase 't' to open the chat then focus the
+        // hidden input so the OS keyboard appears and typing goes into chat.
+        keyboardBtn.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            try {
+                if (isiOS) {
+                    // If the mobile keyboard is already active, do nothing.
+                    if (!mobileKeyboardActive && !jsKeyboardActive) {
+                        // Send 't' to open chat prior to focusing the input so
+                        // the game's chat box is visible when the keyboard opens.
+                        try { sendLowercaseT(); } catch (err) {}
+                        // Focus shortly after sending the chat key so the OS
+                        // keyboard connects to the input (use a small delay).
+                        setTimeout(() => { try { hiddenInput.focus(); } catch (err) {} }, 60);
+                    } else {
+                        try { hiddenInput.focus(); } catch (err) {}
+                    }
+                } else {
+                    try { hiddenInput.focus(); } catch (err) {}
+                }
+            } catch (err) {}
+        }, { passive:false });
+        keyboardBtn.addEventListener('click', (e) => {
+            e.preventDefault();
+            try {
+                if (isiOS) {
+                    if (!mobileKeyboardActive && !jsKeyboardActive) {
+                        try { sendLowercaseT(); } catch (err) {}
+                        setTimeout(() => { try { hiddenInput.focus(); } catch (err) {} }, 60);
+                    } else {
+                        try { hiddenInput.focus(); } catch (err) {}
+                    }
+                } else {
+                    try { hiddenInput.focus(); } catch (err) {}
+                }
+            } catch (err) {}
+        });
+
+        // Wire up JS-Show button: toggle the JS on-screen keyboard. When
+        // opening, do not auto-send any 't' keys — instead wait until the
+        // user starts typing so we avoid accidental / duplicate 't' input.
+        let jsKeyboardNeedsChatOpen = false;
+        function toggleJSKeyboard() {
+            if (jsKeyboardActive) {
+                hideJSKeyboard();
+                jsKeyboardNeedsChatOpen = false;
+            } else {
+                // We want the chat to open the first time the user types,
+                // but avoid synthesizing any key events just by opening the
+                // keyboard UI.
+                jsKeyboardNeedsChatOpen = true;
+                showJSKeyboard(true);
+            }
+        }
+
+        jsShowBtn.addEventListener('touchstart', (e) => { e.preventDefault(); try { toggleJSKeyboard(); } catch (err) {} }, { passive:false });
+        jsShowBtn.addEventListener('click', (e) => { e.preventDefault(); try { toggleJSKeyboard(); } catch (err) {} });
+
+        // Forward keyboard events from the hidden input to the canvas so typed
+        // characters are delivered to the game while the chat UI has focus.
+        // Some mobile keyboards (especially Android) don't reliably emit
+        // keydown/keyup for printable characters; they emit `input` events.
+        // Listen for `input` / composition events and synthesize key events
+        // for every inserted character and backspace so chat receives typed
+        // characters reliably.
+        let hiddenInputPrevValue = '';
+        let composing = false;
+        hiddenInput.addEventListener('keydown', (e) => {
+            // Prevent the input from handling the event itself
+            e.stopPropagation();
+            // Do not forward printable characters here — `input` events
+            // will be used to synthesize character events (many mobile
+            // keyboards don't emit per-character keydown/keyup). Also
+            // skip Backspace because deletions are handled by `input`.
+            const key = e.key;
+            if (key && key.length === 1) return; // printable char — handled by input
+            if (key === 'Backspace') return; // deletions handled by input diff
+
+            // Convert non-printable keys into appropriate events for the canvas
+            try {
+                const key = e.key;
+                let code = e.code || (key && key.length === 1 ? ('Key' + key.toUpperCase()) : key);
+                const keyCode = key && key.length === 1 ? key.toUpperCase().charCodeAt(0) : (key === 'Enter' ? 13 : (key === 'Backspace' ? 8 : 0));
+                const ev = new KeyboardEvent('keydown', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
+                canvas.dispatchEvent(ev); document.dispatchEvent(ev); window.dispatchEvent(ev);
+            } catch (err) {}
+            // Make sure pressing Enter hides keyboard (send Enter as keyup as well)
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                // Keep event forwarding consistent: ensure the engine receives
+                // keyup for Enter (keydown was dispatched earlier in this handler)
+                try { const ev2 = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true }); canvas.dispatchEvent(ev2); document.dispatchEvent(ev2); window.dispatchEvent(ev2); } catch (err) {}
+                // blur the input so mobile keyboard hides
+                setTimeout(() => { try { hiddenInput.blur(); } catch (e) {} }, 10);
+                // After a short delay, clear the message buffer so future
+                // messages start fresh. Do this after the blur so mobile OS
+                // orders are preserved.
+                setTimeout(() => { try { hiddenInput.value = ''; hiddenInputPrevValue = ''; } catch (e) {} }, 120);
+            }
+        });
+
+        hiddenInput.addEventListener('keyup', (e) => {
+            e.stopPropagation();
+            // Only forward non-printable keys here — printable characters
+            // are sent via input() processing above. Skip Backspace (handled
+            // by input) to avoid duplicate deletes.
+            const key = e.key;
+            if (key && key.length === 1) return;
+            if (key === 'Backspace') return;
+            try {
+                let code = e.code || key;
+                const keyCode = key === 'Enter' ? 13 : 0;
+                const ev = new KeyboardEvent('keyup', { key: key, code: code, keyCode: keyCode, which: keyCode, bubbles: true, cancelable: true });
+                canvas.dispatchEvent(ev); document.dispatchEvent(ev); window.dispatchEvent(ev);
+            } catch (err) {}
+            // Do not clear the input on every keyup — the value should be
+            // preserved until the user submits via Enter so we can deliver
+            // the full message reliably.
+        });
+
+        // Handle IME composition events (e.g., complex input) — wait until
+        // compositionend to dispatch final characters.
+        hiddenInput.addEventListener('compositionstart', (e) => {
+            composing = true;
+        });
+        hiddenInput.addEventListener('compositionend', (e) => {
+            composing = false;
+            // treat the composition result like a normal input update
+            handleInputEvent();
+        });
+
+        // Utility to convert single character to event properties
+        function charToEventProps(ch) {
+            if (!ch) return { key: ch, code: '', keyCode: ch.charCodeAt(0), charCode: ch.charCodeAt(0) };
+            if (ch === ' ') return { key: ' ', code: 'Space', keyCode: 32, charCode: 32 };
+            const isLetter = ch.match(/^[a-zA-Z]$/);
+            const isDigit = ch.match(/^\d$/);
+            if (isLetter) {
+                const up = ch.toUpperCase();
+                return { key: ch, code: 'Key' + up, keyCode: up.charCodeAt(0), charCode: ch.charCodeAt(0) };
+            }
+            if (isDigit) {
+                return { key: ch, code: 'Digit' + ch, keyCode: ch.charCodeAt(0), charCode: ch.charCodeAt(0) };
+            }
+            // Generic fallback
+            return { key: ch, code: '', keyCode: ch.charCodeAt(0), charCode: ch.charCodeAt(0) };
+        }
+
+        function sendCharEvents(ch) {
+            const props = charToEventProps(ch);
+            // Do not steal focus when our JS keyboard is active; synthetic
+            // events are dispatched directly to the canvas so focus is not required.
+            try {
+                if (!jsKeyboardActive && !mobileKeyboardActive) canvas.focus();
+            } catch (err) {}
+            // Dispatch character keyboard events only to the canvas element
+            // (the runtime listens on the canvas). Sending to document/window
+            // can cause duplicate handling in some environments.
+            try { const kd = new KeyboardEvent('keydown', { key: props.key, code: props.code, keyCode: props.keyCode, which: props.keyCode, bubbles: true, cancelable: true }); canvas.dispatchEvent(kd); } catch (err) {}
+            try { const kp = new KeyboardEvent('keypress', { key: props.key, code: props.code, keyCode: props.charCode, which: props.charCode, charCode: props.charCode, bubbles: true, cancelable: true }); canvas.dispatchEvent(kp); } catch (err) {}
+            setTimeout(() => { try { const ku = new KeyboardEvent('keyup', { key: props.key, code: props.code, keyCode: props.keyCode, which: props.keyCode, bubbles: true, cancelable: true }); canvas.dispatchEvent(ku); } catch (err) {} }, 6);
+        }
+
+        function sendBackspace() {
+            try { if (!jsKeyboardActive && !mobileKeyboardActive) canvas.focus(); } catch (err) {}
+            try { const kd = new KeyboardEvent('keydown', { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, bubbles: true, cancelable: true }); canvas.dispatchEvent(kd); } catch (err) {}
+            setTimeout(() => { try { const ku = new KeyboardEvent('keyup', { key: 'Backspace', code: 'Backspace', keyCode: 8, which: 8, bubbles: true, cancelable: true }); canvas.dispatchEvent(ku); } catch (err) {} }, 6);
+        }
+
+        function handleInputEvent() {
+            if (composing) return; // wait for compositionend
+            const cur = hiddenInput.value || '';
+            const prev = hiddenInputPrevValue || '';
+            if (cur === prev) return; // nothing changed
+            // Find common prefix
+            let i = 0;
+            while (i < cur.length && i < prev.length && cur[i] === prev[i]) i++;
+            // Find common suffix
+            let j1 = cur.length - 1;
+            let j2 = prev.length - 1;
+            while (j1 >= i && j2 >= i && cur[j1] === prev[j2]) { j1--; j2--; }
+            const added = cur.slice(i, j1 + 1);
+            const removed = prev.slice(i, j2 + 1);
+            // Deleted characters -> send multiple backspaces
+            if (removed.length > 0) {
+                for (let k = 0; k < removed.length; k++) sendBackspace();
+            }
+            // Added characters -> send them one-by-one
+            if (added.length > 0) {
+                for (const ch of added) sendCharEvents(ch);
+            }
+            hiddenInputPrevValue = cur;
+        }
+
+        hiddenInput.addEventListener('input', (e) => {
+            // When our JS keyboard is active we intentionally mirror the
+            // buffer into the hidden input for state consistency, but we
+            // must not forward `input` events to the engine (this would
+            // cause duplicates). Ignore input events while JS keyboard
+            // is active — native keyboards still work normally.
+            if (jsKeyboardActive) return;
+            handleInputEvent();
+        });
+        
+        // --- JavaScript on-screen keyboard (shown when chat opens) ---
+        const jsKb = document.createElement('div');
+        jsKb.id = 'mc_js_keyboard';
+        jsKb.style = `
+            position: absolute; left: 50%; transform: translateX(-50%); bottom: 12px;
+            width: calc(100% - 48px); max-width: 880px; z-index: 12000; display: none;
+            background: rgba(0,0,0,0.62); border-radius: 12px; padding: 8px; box-shadow: 0 8px 28px rgba(0,0,0,0.6);
+            color: #fff; font-family: Arial, sans-serif;
+        `;
+
+        // chat display row
+        const kbDisplay = document.createElement('div');
+        kbDisplay.id = 'mc_kb_display';
+        kbDisplay.style = 'background: rgba(255,255,255,0.06); padding:8px 10px; border-radius:8px; min-height:34px; display:flex; align-items:center; gap:8px;';
+        const kbText = document.createElement('div'); kbText.id = 'mc_kb_text'; kbText.style = 'flex:1; color:#fff; font-size:16px;'; kbText.innerText = '';
+        const kbClear = document.createElement('button'); kbClear.innerText = '×'; kbClear.title = 'Clear'; kbClear.style = 'background:transparent; border:none; color:#fff; font-size:18px; padding:4px;';
+        kbDisplay.appendChild(kbText); kbDisplay.appendChild(kbClear);
+        jsKb.appendChild(kbDisplay);
+
+        // keys: full-featured keyboard with number row, shift, caps, and symbol toggle
+        const alphaRows = [ 'qwertyuiop', 'asdfghjkl', 'zxcvbnm' ];
+        const numberRow = '1234567890';
+        const symbolRows = [
+            '!@#$%^&*()',
+            "-+=/:;?[]{}",
+            "'\"\\,._<>~`"
+        ];
+
+        const keysContainer = document.createElement('div');
+        keysContainer.style = 'display:flex; flex-direction:column; gap:6px; margin-top:8px;';
+        jsKb.appendChild(keysContainer);
+
+        // Active keyboard state
+        let shiftActive = false;
+        let capsLock = false;
+        let symbolMode = false;
+
+        function buildRow(chars) {
+            const row = document.createElement('div');
+            row.style = 'display:flex; gap:6px; justify-content:center;';
+            for (const ch of chars) {
+                const b = document.createElement('button');
+                b.className = 'mc_kb_key';
+                // Display upper/lowercase depending on shift/caps for letters
+                if (!symbolMode && /^[a-zA-Z]$/.test(ch)) {
+                    const up = (capsLock && !shiftActive) || (!capsLock && shiftActive);
+                    b.innerText = up ? ch.toUpperCase() : ch.toLowerCase();
+                } else {
+                    b.innerText = ch;
+                }
+                b.dataset.ch = ch;
+                b.style = 'flex:0 0 36px; height:40px; border-radius:8px; background:rgba(255,255,255,0.06); color:#fff; border:none; font-size:16px;';
+                // Support pointer events to avoid duplicated click syntheses
+                // on touch devices (touch -> synthetic click). We use pointerdown
+                // as the primary handler and ignore the following click if it
+                // happened within a short time window.
+                const handlePress = () => {
+                    // When a letter is typed, respect shift/caps
+                    let out = b.dataset.ch;
+                    if (/[a-zA-Z]/.test(out)) {
+                        const up = (capsLock && !shiftActive) || (!capsLock && shiftActive);
+                        out = up ? out.toUpperCase() : out.toLowerCase();
+                    }
+                    kbAppend(out);
+                    // reset shift if it was a one-off press
+                    if (shiftActive && !capsLock) { shiftActive = false; refreshKeys(); }
+                };
+                b.addEventListener('pointerdown', (e) => { e.preventDefault(); handlePress(); b.__lastPointer = Date.now(); }, { passive:false });
+                b.addEventListener('click', (e) => { if (Date.now() - (b.__lastPointer || 0) < 450) return; handlePress(); });
+                row.appendChild(b);
+            }
+            return row;
+        }
+
+        function refreshKeys() {
+            // rebuild the keys container according to symbolMode
+            keysContainer.innerHTML = '';
+            // numbers row is useful in both modes (can show 123.. or symbol variants)
+            keysContainer.appendChild(buildRow(numberRow.split('')));
+            if (!symbolMode) {
+                for (const r of alphaRows) keysContainer.appendChild(buildRow(r.split('')));
+            } else {
+                for (const r of symbolRows) keysContainer.appendChild(buildRow(r.split('')));
+            }
+        }
+
+        refreshKeys();
+
+        // last row: space, backspace, enter
+        const last = document.createElement('div'); last.style = 'display:flex; gap:8px; margin-top:10px; justify-content:center; align-items:center;';
+        const shiftBtn = document.createElement('button'); shiftBtn.innerText = 'Shift'; shiftBtn.title = 'Shift'; shiftBtn.style = 'width:72px; height:44px; border-radius:10px; background:rgba(255,255,255,0.06); color:#fff; border:none; font-size:14px;';
+        const capsBtn = document.createElement('button'); capsBtn.innerText = 'Caps'; capsBtn.title = 'Caps Lock'; capsBtn.style = 'width:64px; height:44px; border-radius:10px; background:rgba(255,255,255,0.03); color:#fff; border:none; font-size:14px;';
+        const space = document.createElement('button'); space.innerText = 'Space'; space.style = 'flex:1; height:44px; border-radius:10px; background:rgba(255,255,255,0.06); color:#fff; border:none; font-size:16px;';
+        const bk = document.createElement('button'); bk.innerText = '⌫'; bk.title = 'Backspace'; bk.style = 'width:56px; height:44px; border-radius:10px; background:rgba(255,255,255,0.06); color:#fff; border:none; font-size:18px;';
+        const send = document.createElement('button'); send.innerText = 'Send'; send.title = 'Send (Enter)'; send.style = 'width:86px; height:44px; border-radius:10px; background:rgba(0,160,255,0.9); color:#fff; border:none; font-weight:700;';
+        const symBtn = document.createElement('button'); symBtn.innerText = 'Sym'; symBtn.title = 'Symbols'; symBtn.style = 'width:64px; height:44px; border-radius:10px; background:rgba(255,255,255,0.03); color:#fff; border:none; font-size:14px;';
+        last.appendChild(shiftBtn); last.appendChild(capsBtn); last.appendChild(space); last.appendChild(bk); last.appendChild(send); last.appendChild(symBtn);
+        jsKb.appendChild(last);
+
+        // attach keyboard to container so it overlays properly
+        container.appendChild(jsKb);
+
+        // keyboard helpers
+        // Append a character to the on-screen keyboard buffer only.
+        // Characters are NOT dispatched to the WASM engine until the
+        // user explicitly presses the Send button. This prevents duplicate
+        // / premature characters when using our JS keyboard on mobile.
+        // Track how many characters we've already dispatched to the
+        // engine in real-time, so we avoid resending them when the
+        // user finally presses Send. This allows certain keys (e.g.,
+        // backspace, space) to act immediately without duplication.
+        let kbSentCount = 0;
+
+        function kbAppend(ch) {
+            // If this JS keyboard was opened but the in-game chat has not
+            // yet been opened, synthesize a single 't' to open the chat
+            // window before sending typed characters. This keeps the UI
+            // quiet when the keyboard is opened and prevents multiple 't'
+            // characters from being injected on open.
+            if (jsKeyboardNeedsChatOpen) {
+                try { sendLowercaseT(); } catch (e) {}
+                jsKeyboardNeedsChatOpen = false;
+            }
+            kbText.innerText += ch;
+            // mirror the visible JS keyboard text into the hidden input so
+            // input handlers (if any) see the same text and state stays consistent.
+            try { hiddenInput.value = kbText.innerText; hiddenInputPrevValue = hiddenInput.value; } catch (err) {}
+            // For the space key, deliver it immediately to the engine so
+            // users see the space in the chat UI in real-time. We count it
+            // as already-sent (kbSentCount) so Send won't re-send it.
+            if (ch === ' ' && jsKeyboardActive) {
+                try { sendCharEvents(ch); kbSentCount++; } catch (e) {}
+            }
+            // Intentionally do NOT call sendCharEvents() for other keys
+            // here — they'll be sent later when the user presses Send.
+        }
+        // Backspace only modifies the on-screen buffer; do not synthesize
+        // backspace events until the final message is sent.
+        function kbBackspace() {
+            // If the JS keyboard was opened but chat hasn't been opened in
+            // the engine yet, open it so the backspace takes effect in the
+            // chat UI (and not only locally in the buffer).
+            if (jsKeyboardNeedsChatOpen) {
+                try { sendLowercaseT(); } catch (e) {}
+                jsKeyboardNeedsChatOpen = false;
+            }
+
+            if (kbText.innerText.length > 0) {
+                kbText.innerText = kbText.innerText.slice(0, -1);
+                try { hiddenInput.value = kbText.innerText; hiddenInputPrevValue = hiddenInput.value; } catch (err) {}
+                // Also send a real backspace event to the canvas so the
+                // engine's chat box is updated immediately while typing.
+                try { sendBackspace(); } catch (e) {}
+                if (kbSentCount > 0) kbSentCount = Math.max(0, kbSentCount - 1);
+            } else {
+                // Buffer empty: still send a backspace so the engine's
+                // input state can respond (some UI may have text already).
+                try { sendBackspace(); } catch (e) {}
+                if (kbSentCount > 0) kbSentCount = Math.max(0, kbSentCount - 1);
+            }
+        }
+        function kbSend() {
+            // When the user presses Send, dispatch the buffered characters
+            // as synthetic key events to the canvas/engine, then press Enter
+            // so that the chat gets submitted.
+            const msg = kbText.innerText || '';
+            // Only send the characters that haven't already been dispatched
+            // in real-time (kbSentCount). This avoids duplicate characters
+            // for keys like Space which we may have sent immediately.
+            const startIndex = Math.min(Math.max(0, kbSentCount), msg.length);
+            const unsent = msg.slice(startIndex);
+            if (unsent.length > 0) {
+                for (let i = 0; i < unsent.length; i++) {
+                    const ch = unsent[i];
+                    setTimeout(() => { try { sendCharEvents(ch); } catch (e) {} }, i * 18);
+                }
+            }
+            // Schedule Enter after the unsent characters finish dispatching
+            const enterDelay = Math.max(1, unsent.length * 18) + 30;
+            // Dispatch a proper Enter key sequence (keydown -> keypress -> keyup)
+            setTimeout(() => {
+                try {
+                    const kd = new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+                    const kp = new KeyboardEvent('keypress', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+                    const ku = new KeyboardEvent('keyup', { key: 'Enter', code: 'Enter', keyCode: 13, which: 13, bubbles: true, cancelable: true });
+                    canvas.dispatchEvent(kd);
+                    canvas.dispatchEvent(kp);
+                    // Slight delay before keyup to mimic real user press
+                    setTimeout(() => { canvas.dispatchEvent(ku); }, 20);
+                } catch (e) { }
+            }, enterDelay);
+
+            // hide keyboard and clear text after sending
+            kbText.innerText = '';
+            // reset sent counter (we've delivered everything)
+            kbSentCount = 0;
+            try { hiddenInput.value = ''; hiddenInputPrevValue = ''; } catch (err) {}
+            shiftActive = false; refreshKeys();
+            hideJSKeyboard();
+        }
+        // Use pointerdown for reliable touch response and prevent duplicate
+        // synthetic click events that would call handlers twice.
+        kbClear.addEventListener('pointerdown', (e) => { e.preventDefault(); kbText.innerText = ''; hiddenInput.value = ''; hiddenInputPrevValue = ''; kbClear.__lastPointer = Date.now(); }, { passive:false });
+        kbClear.addEventListener('click', (e) => { if (Date.now() - (kbClear.__lastPointer || 0) < 450) return; kbText.innerText = ''; hiddenInput.value = ''; hiddenInputPrevValue = ''; });
+        space.addEventListener('pointerdown', (e) => { e.preventDefault(); kbAppend(' '); space.__lastPointer = Date.now(); }, { passive:false });
+        space.addEventListener('click', (e) => { if (Date.now() - (space.__lastPointer || 0) < 450) return; kbAppend(' '); });
+        bk.addEventListener('pointerdown', (e) => { e.preventDefault(); kbBackspace(); bk.__lastPointer = Date.now(); }, { passive:false });
+        bk.addEventListener('click', (e) => { if (Date.now() - (bk.__lastPointer || 0) < 450) return; kbBackspace(); });
+        send.addEventListener('pointerdown', (e) => { e.preventDefault(); kbSend(); send.__lastPointer = Date.now(); }, { passive:false });
+        send.addEventListener('click', (e) => { if (Date.now() - (send.__lastPointer || 0) < 450) return; kbSend(); });
+        // shift / caps / symbols
+        shiftBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); shiftActive = !shiftActive; shiftBtn.style.background = shiftActive ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)'; refreshKeys(); shiftBtn.__lastPointer = Date.now(); }, { passive:false });
+        shiftBtn.addEventListener('click', (e) => { if (Date.now() - (shiftBtn.__lastPointer || 0) < 450) return; shiftActive = !shiftActive; shiftBtn.style.background = shiftActive ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.06)'; refreshKeys(); });
+        capsBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); capsLock = !capsLock; capsBtn.style.background = capsLock ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.03)'; refreshKeys(); capsBtn.__lastPointer = Date.now(); }, { passive:false });
+        capsBtn.addEventListener('click', (e) => { if (Date.now() - (capsBtn.__lastPointer || 0) < 450) return; capsLock = !capsLock; capsBtn.style.background = capsLock ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.03)'; refreshKeys(); });
+        symBtn.addEventListener('pointerdown', (e) => { e.preventDefault(); symbolMode = !symbolMode; symBtn.style.background = symbolMode ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.03)'; refreshKeys(); symBtn.__lastPointer = Date.now(); }, { passive:false });
+        symBtn.addEventListener('click', (e) => { if (Date.now() - (symBtn.__lastPointer || 0) < 450) return; symbolMode = !symbolMode; symBtn.style.background = symbolMode ? 'rgba(255,255,255,0.18)' : 'rgba(255,255,255,0.03)'; refreshKeys(); });
+
+        // Show/hide helpers
+        function showJSKeyboard(show) {
+            if (show) {
+                // if the hidden input is focused (native keyboard), blur it —
+                // we're using our own JS keyboard now.
+                try { hiddenInput.blur(); } catch (e) {}
+                mobileKeyboardActive = false;
+                jsKeyboardActive = true; jsKb.style.display = 'block';
+            } else {
+                jsKeyboardActive = false; jsKb.style.display = 'none';
+            }
+        }
+        function hideJSKeyboard() { kbText.innerText = ''; try { hiddenInput.value = ''; hiddenInputPrevValue = ''; } catch (err) {} showJSKeyboard(false); }
+
+        // When the game's chat is closed by the game itself, or ESC is used,
+        // the UI should hide our keyboard as well. Hook the keyboard close
+        // to the Escape key (which the game will call), and also allow the
+        // menu button to hide it.
+        menuBtn.addEventListener('click', (e) => { e.preventDefault(); sendEscapePress(); hideJSKeyboard(); });
+
+    // place overlay inside the canvas container so it layers above the canvas
+    container.style.position = 'relative';
+    container.appendChild(overlay);
+
+    // --- Debug HUD (visible while developing) ---
+    const dbg = document.createElement('div');
+    dbg.id = 'mc_debug';
+    dbg.style = `position: absolute; left: 8px; top: 8px; z-index: 13000; pointer-events: none; color: #fff; background: rgba(0,0,0,0.45); padding:6px 8px; border-radius:6px; font-size:12px; max-width: 260px;`;
+    dbg.innerText = 'Debug: initializing...';
+    container.appendChild(dbg);
+    let dbgInterval = setInterval(() => {
+        try {
+            if (!isiOS) {
+            const cw = canvas.width || 0;
+            const ch = canvas.height || 0;
+            const csw = canvas.style ? (canvas.style.width || 'auto') : 'n/a';
+            const csh = canvas.style ? (canvas.style.height || 'auto') : 'n/a';
+            const fs = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement);
+            dbg.innerText = `Canvas: ${cw}x${ch}\nCSS: ${csw} x ${csh}\nFullscreen: ${fs}\nOverlay visible: ${overlay.style.display}`;
+            }
+        } catch (e) { dbg.innerText = 'Debug: error reading canvas'; }
+    }, 500);
+
+    // --- Input mapping helpers ---
+    // Track simple key down state to avoid duplicate events. Add Escape
+    // so UI buttons that synthesize 'Escape' behave correctly.
+    const keyState = { KeyW: false, KeyA: false, KeyS: false, KeyD: false, Space: false, Escape: false };
+    // When the mobile keyboard is active (hidden input focused) avoid
+    // calling canvas.focus(), which would steal focus and cause the
+    // system keyboard to immediately close on many mobile browsers.
+    // These are assigned to globals (declared earlier) so top-level
+    // functions can safely consult keyboard state.
+    mobileKeyboardActive = false;
+    // When our JS on-screen keyboard is visible, avoid focusing the canvas
+    // and route events via the JS keyboard.
+    jsKeyboardActive = false;
+
+    function sendKey(code, down) {
+        // Avoid sending duplicate events
+        if (keyState[code] === down) return;
+        keyState[code] = down;
+
+        // Provide broader event properties to maximize compatibility with older engines
+        const keyName = (code === 'Space') ? ' ' : code.replace('Key', '');
+        // Add commonly-used keyCodes so compiled engines that rely on keyCode/which
+        // can also see these values. Inventory typically uses 'I' (73) or 'E' (69).
+        // Include common legacy keyCode values so older engines detect keys like Escape (27).
+        const keyCodeMap = { KeyW: 87, KeyA: 65, KeyS: 83, KeyD: 68, Space: 32, KeyI: 73, KeyE: 69, Escape: 27 };
+        const kc = keyCodeMap[code] || 0;
+
+        // Focus the canvas first so SDl/wasm receives these events, but
+        // do not steal focus while the mobile keyboard is active.
+        try { if (!mobileKeyboardActive && !jsKeyboardActive) canvas.focus(); } catch (e) { }
+
+        // Some environments expect keyCode/which to exist, also ensure events bubble
+        let ev;
+        try {
+            ev = new KeyboardEvent(down ? 'keydown' : 'keyup', {
+                code: code,
+                key: keyName,
+                keyCode: kc,
+                which: kc,
+                bubbles: true,
+                cancelable: true
+            });
+        } catch (err) {
+            // Fallback for older browsers that don't accept full args
+            ev = document.createEvent('KeyboardEvent');
+            // initKeyboardEvent differs across browsers; try best-effort
+            try { ev.initKeyboardEvent(down ? 'keydown' : 'keyup', true, true, window, keyName, 0, '', false, ''); } catch (e) { /* ignore */ }
+        }
+
+        // Dispatch to multiple targets so the wasm/SDL input handlers catch them.
+        canvas.dispatchEvent(ev);
+        document.dispatchEvent(ev);
+        window.dispatchEvent(ev);
+
+        // No extra 'keypress' synthetic events here — keep sendKey strict so a caller
+        // deciding to synthesize a press can do so explicitly. This ensures buttons
+        // mapped to a specific code (like 'KeyI') only send that key event.
+    }
+
+    // Helper to send a short key press (keydown then keyup) and ensure canvas is focused.
+    // Keep this for compatibility, but inventory will also support plain down/up mapping.
+    function sendKeyPress(code) {
+        // focus canvas so SDL/wasm accepts the key, but avoid stealing
+        // focus from the mobile input when it's active.
+        try { if (!mobileKeyboardActive && !jsKeyboardActive) canvas.focus(); } catch (e) {}
+        // Try several forms (lower/upper, keypress) and a short sequence so the wasm engine accepts it.
+        const tryPress = (c, keyChar) => {
+            try { sendKey(c, true); } catch (e) {}
+            try {
+                const kp = new KeyboardEvent('keypress', { key: keyChar, code: c, keyCode: keyChar.charCodeAt(0), which: keyChar.charCodeAt(0), bubbles: true, cancelable: true });
+                canvas.dispatchEvent(kp); document.dispatchEvent(kp); window.dispatchEvent(kp);
+            } catch (err) {}
+            // scheduled keyup
+            setTimeout(() => { try { sendKey(c, false); } catch (e) {} }, 60);
+        };
+
+        const keyName = code.replace('Key', '');
+        // attempt lowercase and uppercase variants shortly apart
+        tryPress(code, keyName.toLowerCase());
+        setTimeout(() => tryPress(code, keyName.toUpperCase()), 80);
+
+        // Removed KeyE fallback — keep sendKeyPress focused on the requested code only
+        // (attempted lowercase + uppercase variants above).
+    }
+
+    // Fullscreen control moved to a manual toggle button. We no longer auto-request
+    // fullscreen on the first touch — users can explicitly toggle fullscreen via the
+    // top-right button introduced below.
+
+    function sendMouse(type, clientX, clientY, button=0, movementX=0, movementY=0) {
+        // Create MouseEvent; browsers may not honor movementX/movementY in constructor, so include client coords
+        const ev = new MouseEvent(type, { bubbles: true, cancelable: true, clientX, clientY, button });
+        canvas.dispatchEvent(ev);
+        document.dispatchEvent(ev);
+    }
+
+    // --- Left joystick logic (WASD) ---
+    let leftTouchId = null;
+    let leftCenter = { x: 0, y: 0 };
+    let leftRadius = 0;
+
+    leftPad.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        // don't auto-request fullscreen on touch; user may use the fullscreen toggle
+        const t = e.changedTouches[0];
+        leftTouchId = t.identifier;
+        const rect = leftPad.getBoundingClientRect();
+        leftCenter = { x: rect.left + rect.width/2, y: rect.top + rect.height/2 };
+        leftRadius = Math.min(rect.width, rect.height)/2;
+        updateLeftThumb(t.clientX, t.clientY);
+    }, { passive: false });
+
+    leftPad.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        for (const t of Array.from(e.changedTouches)) {
+            if (t.identifier !== leftTouchId) continue;
+            updateLeftThumb(t.clientX, t.clientY);
+        }
+    }, { passive: false });
+
+    leftPad.addEventListener('touchend', (e) => {
+        for (const t of Array.from(e.changedTouches)) {
+            if (t.identifier !== leftTouchId) continue;
+            leftTouchId = null;
+            leftThumb.style.transform = 'translate(0px,0px)';
+            // release all movement keys
+            sendKey('KeyW', false);
+            sendKey('KeyA', false);
+            sendKey('KeyS', false);
+            sendKey('KeyD', false);
+        }
+    }, { passive: false });
+
+    // Ensure touchcancel also releases movement so states don't stick
+    leftPad.addEventListener('touchcancel', (e) => {
+        leftTouchId = null;
+        leftThumb.style.transform = 'translate(0px,0px)';
+        sendKey('KeyW', false);
+        sendKey('KeyA', false);
+        sendKey('KeyS', false);
+        sendKey('KeyD', false);
+    }, { passive: false });
+
+    function updateLeftThumb(cx, cy) {
+        const dx = cx - leftCenter.x;
+        const dy = cy - leftCenter.y;
+        const dist = Math.sqrt(dx*dx + dy*dy);
+        const max = leftRadius * 0.6;
+        const nx = Math.max(-1, Math.min(1, dx / max));
+        const ny = Math.max(-1, Math.min(1, dy / max));
+        const tx = nx * max * 0.6; // visual
+        const ty = ny * max * 0.6;
+        leftThumb.style.transform = `translate(${tx}px, ${ty}px)`;
+
+        // Simple 4-direction mapping with diagonal support
+        // Use a slightly lower threshold for responsiveness on smaller movements
+        const TH = 0.22;
+        const up = ny < -TH;
+        const down = ny > TH;
+        const left = nx < -TH;
+        const right = nx > TH;
+
+        sendKey('KeyW', up);
+        sendKey('KeyS', down);
+        sendKey('KeyA', left);
+        sendKey('KeyD', right);
+    }
+
+    // --- Buttons: Jump, Primary (left click), Secondary (right click) ---
+    function makeButtonTouchHandlers(btn, onDown, onUp) {
+        btn.addEventListener('touchstart', (e) => { e.preventDefault(); onDown(); }, { passive:false });
+        btn.addEventListener('touchend', (e) => { e.preventDefault(); onUp(); }, { passive:false });
+        btn.addEventListener('touchcancel', (e) => { e.preventDefault(); onUp(); }, { passive:false });
+        // mouse fallback for desktop testing
+        btn.addEventListener('mousedown', (e) => { e.preventDefault(); onDown(); });
+        btn.addEventListener('mouseup', (e) => { e.preventDefault(); onUp(); });
+    }
+
+    // Jump only toggles Space; Use simulates a right-click (button=2)
+    makeButtonTouchHandlers(btnJump, () => sendKey('Space', true), () => sendKey('Space', false));
+    makeButtonTouchHandlers(btnUse, () => sendMouse('mousedown', canvas.clientWidth/2, canvas.clientHeight/2, 2), () => sendMouse('mouseup', canvas.clientWidth/2, canvas.clientHeight/2, 2));
+
+    // Inventory toggles 'I' key — use the same down/up mapping as other controls
+    // Inventory often expects the printable lowercase 'i' character.
+    // Send a focused sequence: keydown (code=KeyI, key='i'), keypress (char 'i'), then keyup.
+    function sendLowercaseI() {
+        try { if (!mobileKeyboardActive && !jsKeyboardActive) canvas.focus(); } catch (e) {}
+        const code = 'KeyI';
+        const keyChar = 'i';
+        const keyDownCode = 73; // keyCode for 'I' physical key
+        const charCode = keyChar.charCodeAt(0); // 105 for 'i'
+
+        // keydown with lowercase key
+        try {
+            const ev = new KeyboardEvent('keydown', { code: code, key: keyChar, keyCode: keyDownCode, which: keyDownCode, bubbles: true, cancelable: true });
+            canvas.dispatchEvent(ev); document.dispatchEvent(ev); window.dispatchEvent(ev);
+        } catch (err) {}
+
+        // keypress for printable lowercase char
+        try {
+            const kp = new KeyboardEvent('keypress', { key: keyChar, code: code, keyCode: charCode, which: charCode, charCode: charCode, bubbles: true, cancelable: true });
+            canvas.dispatchEvent(kp); document.dispatchEvent(kp); window.dispatchEvent(kp);
+        } catch (err) {}
+
+        // keyup
+        setTimeout(() => {
+            try {
+                const ev2 = new KeyboardEvent('keyup', { code: code, key: keyChar, keyCode: keyDownCode, which: keyDownCode, bubbles: true, cancelable: true });
+                canvas.dispatchEvent(ev2); document.dispatchEvent(ev2); window.dispatchEvent(ev2);
+            } catch (err) {}
+        }, 60);
+    }
+
+    makeButtonTouchHandlers(btnInv, () => sendLowercaseI(), () => {});
+
+    // Send wheel event for hotbar change. deltaY negative -> scroll up (previous), positive -> scroll down (next)
+    function sendWheel(deltaY) {
+        const rect = canvas.getBoundingClientRect();
+        const cx = Math.round(rect.left + rect.width/2);
+        const cy = Math.round(rect.top + rect.height/2);
+        let ev;
+        try {
+            ev = new WheelEvent('wheel', { bubbles: true, cancelable: true, deltaY: deltaY, clientX: cx, clientY: cy });
+        } catch (err) {
+            // older browsers may not allow constructor options, fall back
+            ev = document.createEvent('Event');
+            ev.initEvent('wheel', true, true);
+            ev.deltaY = deltaY;
+            ev.clientX = cx;
+            ev.clientY = cy;
+        }
+        canvas.dispatchEvent(ev);
+        document.dispatchEvent(ev);
+    }
+
+    makeButtonTouchHandlers(hbLeft, () => sendWheel(-120), () => {});
+    makeButtonTouchHandlers(hbRight, () => sendWheel(120), () => {});
+
+    // --- Right pad: look / mouse movement simulation ---
+    let rightTouchId = null;
+    let lastPos = null;
+
+    rightPad.addEventListener('touchstart', (e) => {
+        e.preventDefault();
+        // intentionally avoid auto-fullscreen here; use the explicit control button
+        const t = e.changedTouches[0];
+        rightTouchId = t.identifier;
+        lastPos = { x: t.clientX, y: t.clientY };
+        // Try to request pointerlock, but only when the runtime indicates
+        // it wants pointer lock or when the browser supports it. This avoids
+        // noisy console errors when the request isn't supported or when
+        // the runtime isn't ready to handle pointerlock requests.
+        try {
+            // If the engine has exposed a 'want pointerlock' check, prefer
+            // that so the runtime can opt into pointer lock behaviour.
+            if (typeof irrlicht_want_pointerlock === 'function') {
+                try {
+                    if (irrlicht_want_pointerlock()) {
+                        if (typeof irrlicht_force_pointerlock === 'function') {
+                            irrlicht_force_pointerlock();
+                        } else if (canvas.requestPointerLock) {
+                            canvas.requestPointerLock();
+                        }
+                    }
+                } catch (err) { /* ignore */ }
+            } else if (canvas.requestPointerLock) {
+                // Fallback: request pointerlock directly if available.
+                try { canvas.requestPointerLock(); } catch (err) { /* ignore */ }
+            }
+        } catch (e) {}
+    }, { passive:false });
+
+    rightPad.addEventListener('touchmove', (e) => {
+        e.preventDefault();
+        for (const t of Array.from(e.changedTouches)) {
+            if (t.identifier !== rightTouchId) continue;
+            const dx = t.clientX - lastPos.x;
+            const dy = t.clientY - lastPos.y;
+            lastPos = { x: t.clientX, y: t.clientY };
+            // Send small mousemove events so WASM receives movement
+            sendMouse('mousemove', t.clientX, t.clientY, 0, dx, dy);
+        }
+    }, { passive:false });
+
+    rightPad.addEventListener('touchend', (e) => {
+        for (const t of Array.from(e.changedTouches)) {
+            if (t.identifier !== rightTouchId) continue;
+            rightTouchId = null;
+            lastPos = null;
+        }
+    }, { passive:false });
+
+    rightPad.addEventListener('touchcancel', (e) => {
+        rightTouchId = null;
+        lastPos = null;
+    }, { passive:false });
+
+    // Small helper to show for short-screen devices: enable overlay controls for small widths
+    function adjustOverlayVisibility() {
+        if (window.innerWidth < 900 || isTouch) {
+            overlay.style.display = 'flex';
+        } else {
+            overlay.style.display = 'none';
+        }
+    }
+
+    window.addEventListener('resize', adjustOverlayVisibility);
+    adjustOverlayVisibility();
+
+    // --- Fullscreen toggle button (explicit control) ---
+    // create a small toggle in the top-right corner so users can persistently
+    // enter fullscreen and exit explicitly.
+    const fsBtn = document.createElement('button');
+    fsBtn.id = 'mc_fullscreen';
+    fsBtn.title = 'Toggle fullscreen';
+    fsBtn.innerText = '⤢';
+    // Place the fullscreen toggle beside the hotbar controls so it's easy
+    // to access while in-game. Use the existing button visual style so it
+    // matches the other action buttons.
+    fsBtn.style = btnStyle + ' width:48px; height:48px; font-size:18px; margin-left:6px;';
+    // Attach the fullscreen button into the main buttons cluster so it
+    // appears next to the hotbar left/right arrows.
+    buttons.appendChild(fsBtn);
+
+    let _manualFullscreenToggled = false;
+    function setFullscreenUI(on) {
+        _manualFullscreenToggled = !!on;
+        // visual state: filled vs outline, simple text change
+        fsBtn.innerText = on ? '⤡' : '⤢';
+    }
+
+    async function toggleFullscreen() {
+        try {
+            if (!_manualFullscreenToggled) {
+                if (container.requestFullscreen) await container.requestFullscreen();
+                else if (container.webkitRequestFullscreen) await container.webkitRequestFullscreen();
+                else if (container.mozRequestFullScreen) await container.mozRequestFullScreen();
+                else if (container.msRequestFullscreen) await container.msRequestFullscreen();
+                setFullscreenUI(true);
+            } else {
+                if (document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement) {
+                    try { await document.exitFullscreen?.(); } catch(e) { try { document.webkitExitFullscreen?.(); } catch(e) {} }
+                }
+                setFullscreenUI(false);
+            }
+        } catch (err) {
+            // ignore fullscreen errors
+        }
+    }
+
+    fsBtn.addEventListener('click', (e) => { e.preventDefault(); toggleFullscreen(); });
+
+    // Keep UI in-sync if the browser exits fullscreen by other means (ESC/etc.)
+    const onFullScreenChange = () => {
+        const active = !!(document.fullscreenElement || document.webkitFullscreenElement || document.mozFullScreenElement || document.msFullscreenElement);
+        setFullscreenUI(active);
+        // Ensure the canvas is re-computed and scaled appropriately when
+        // the browser enters/exits fullscreen. On small mobile screens the
+        // native canvas size can be larger than the physical screen — in
+        // that case we want to apply a CSS scale so in-game UI (inventory)
+        // fits inside the device viewport.
+        try { fixGeometry(true); } catch (e) { /* best-effort */ }
+    };
+    document.addEventListener('fullscreenchange', onFullScreenChange);
+    document.addEventListener('webkitfullscreenchange', onFullScreenChange);
+    document.addEventListener('mozfullscreenchange', onFullScreenChange);
+    document.addEventListener('MSFullscreenChange', onFullScreenChange);
+
+    // --- Scroll down helper (for tall UI like inventory) ---
+    // A button near the fullscreen toggle that, when pressed/held, repeatedly
+    // sends wheel events to the canvas so users can scroll tall in-game panels.
+    const scrollDownBtn = document.createElement('button');
+    scrollDownBtn.id = 'mc_scroll_down';
+    scrollDownBtn.title = 'Scroll down';
+    scrollDownBtn.innerText = '↓';
+    scrollDownBtn.style = `
+        position: absolute; right: 12px; top: 56px; z-index: 11000; pointer-events: auto;
+        padding: 8px 10px; border-radius: 10px; background: rgba(0,0,0,0.22); color: #fff;
+        font-weight:700; border: none; box-shadow: 0 6px 18px rgba(0,0,0,0.4);
+    `;
+    container.appendChild(scrollDownBtn);
+
+    // When held, repeatedly call sendWheel with a positive deltaY. Single tap does one scroll.
+    let _scrollHoldInterval = null;
+    function startScrollDown() {
+        // first immediate scroll for responsiveness
+        try { sendWheel(240); } catch (e) {}
+        if (_scrollHoldInterval) return;
+        _scrollHoldInterval = setInterval(() => { try { sendWheel(240); } catch (e) {} }, 90);
+    }
+    function stopScrollDown() {
+        if (_scrollHoldInterval) { clearInterval(_scrollHoldInterval); _scrollHoldInterval = null; }
+    }
+
+    // touch handlers
+    scrollDownBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startScrollDown(); }, { passive:false });
+    scrollDownBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopScrollDown(); }, { passive:false });
+    scrollDownBtn.addEventListener('touchcancel', (e) => { e.preventDefault(); stopScrollDown(); }, { passive:false });
+    // mouse click/hold fallback for desktop testing
+    scrollDownBtn.addEventListener('mousedown', (e) => { e.preventDefault(); startScrollDown(); });
+    scrollDownBtn.addEventListener('mouseup', (e) => { e.preventDefault(); stopScrollDown(); });
 }
 
 var PB_bytes_downloaded = 0;
@@ -393,8 +1464,12 @@ function fixGeometry(override) {
     var screenX;
     var screenY;
 
-    // Prevent the controls from getting focus
-    canvas.focus();
+    // Prevent the controls from getting focus — but if the mobile chat input
+    // is focused or our JS/native keyboard is visible, don't steal focus
+    // (this would hide the OS keyboard or our UI).
+    if (!(document.activeElement && document.activeElement.id === 'mc_text_input') && !mobileKeyboardActive && !jsKeyboardActive) {
+        canvas.focus();
+    }
 
     var isFullScreen = document.fullscreenElement ? true : false;
     if (isFullScreen) {
@@ -447,13 +1522,53 @@ function fixGeometry(override) {
         resY = Math.floor(realY / 2.0);
         scale = true;
     }
+    // If fullscreen on a phone, some engines perform better with a fixed
+    // canvas resolution. Force the native canvas resolution to 1194x485
+    // when fullscreen on mobile devices (best-effort detection via UA / touch).
+    const isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints && navigator.maxTouchPoints > 0);
+    const isMobileUA = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent || '');
+    if (isFullScreen && isTouchDevice && isMobileUA) {
+        // Force the desired native resolution
+        resX = 1194;
+        resY = 485;
+    }
+
+    // When NOT fullscreened, use a fixed native canvas resolution so the
+    // visible viewport / UI layout is predictable across devices.
+    // User-requested: set the canvas to 1194x495 when not fullscreened.
+    // When NOT fullscreened, use a fixed native canvas resolution so the
+    // visible viewport / UI layout is predictable across devices. Only
+    // apply this fixed size for mobile/touch devices (user requested).
+    if (!isFullScreen && isTouchDevice && isMobileUA) {
+        resX = 1194;
+        resY = 495;
+    }
+
     resizeCanvas(resX, resY);
 
-    if (scale) {
-        var styleWidth = realX + "px";
-        var styleHeight = realY + "px";
-        canvas.style.setProperty("width", styleWidth, "important");
-        canvas.style.setProperty("height", styleHeight, "important");
+    // Decide whether to set CSS width/height to scale the canvas on-screen.
+    // Normally we only set CSS when the resolution select chose a scaled
+    // mode (medium/low). But when fullscreen is active on small devices the
+    // native canvas can be larger than the physical screen and needs to be
+    // scaled down so the player can see UI overlays (inventory windows).
+    let shouldSetStyle = !!scale;
+    // If fullscreen and the native canvas is larger than the device screen,
+    // force CSS scaling so the canvas fits inside the viewport.
+    if (isFullScreen && (resX > screenX || resY > screenY)) {
+        shouldSetStyle = true;
+    }
+
+    if (shouldSetStyle) {
+        let styleW = realX;
+        let styleH = realY;
+        if (isFullScreen) {
+            // Scale down to fit the physical screen while preserving aspect.
+            const factor = Math.min(1.0, screenX / realX, screenY / realY);
+            styleW = Math.max(1, Math.round(realX * factor));
+            styleH = Math.max(1, Math.round(realY * factor));
+        }
+        canvas.style.setProperty("width", styleW + "px", "important");
+        canvas.style.setProperty("height", styleH + "px", "important");
     } else {
         canvas.style.removeProperty("width");
         canvas.style.removeProperty("height");
@@ -573,7 +1688,7 @@ class MinetestLauncher {
         this.vpn = null;
         this.serverCode = null;
         this.clientCode = null;
-        this.proxyUrl = "wss://minetest.dustlabs.io/proxy";
+        this.proxyUrl = "wss://bc3d.etherdeck.org/proxy";
         this.packsDir = DEFAULT_PACKS_DIR;
         this.packsDirIsCors = false;
         this.minetestConf = new Map();
@@ -771,7 +1886,13 @@ class MinetestLauncher {
             _free(vpnBuf);
         }
         if (args.go) {
-            irrlicht_force_pointerlock();
+            // Prefer the runtime's pointerlock helper if available; otherwise
+            // fall back to a direct request on the canvas (guarded).
+            if (typeof irrlicht_force_pointerlock === 'function') {
+                try { irrlicht_force_pointerlock(); } catch (e) { /* ignore */ }
+            } else if (mtCanvas.requestPointerLock) {
+                try { mtCanvas.requestPointerLock(); } catch (e) { /* ignore */ }
+            }
         }
         mtScheduler.setCondition("launch_called");
     }
